@@ -24,9 +24,9 @@
 
 # load R libraries
 library("sleuth")
-#library("RSQLite")
-#library("dplyr")
-#library("tidyr")
+library("RSQLite")
+library("dplyr")
+library("tidyr")
 library('cowplot')
 
 # variables
@@ -85,7 +85,7 @@ target_mapping <- target_mapping[, c("target_id", "gene_id", 'gene_name')]
 # transcript-level counts estimated with kallisto
 # dPCA performed with sleuth
 
-pca_sleuth <- function() {
+diff_exp_sleuth <- function(condition1, condition2, level) {
 
 	# re-format metadata to meet sleuth's required format
 	# later on, the 'sleuth_prep' function of sleuth will assign 0=untreated and 1=treated condition
@@ -94,7 +94,29 @@ pca_sleuth <- function() {
 	tab_metadata <- metadata
 	rownames(tab_metadata) <- tab_metadata$sample
 
+	conditions <- c()
+	for (i in 1:nrow(tab_metadata)) {
+		tag <- tab_metadata[i, 'condition']
+		if (tag == condition1) {
+			conditions <- c(conditions, 0)
+		}
+		else if (tag == condition2) {
+			conditions <- c(conditions, 1)
+		}
+		else {
+			conditions <- c(conditions, -1)
+		}
+	}
+	tab_metadata$condition_name <- tab_metadata$condition
+ 	tab_metadata$condition <- conditions
+
+	# subset samples to include only those from the 2 conditions compared
+	cond1 <- tab_metadata$condition == 0
+  	cond2 <- tab_metadata$condition == 1
+ 	tab_metadata <- tab_metadata[cond1 | cond2, ]
+
  	# get paths to data
+ 	samples <- tab_metadata$sample
 	paths <- c()
 	for (s in samples) {
 		p <- paste0(SAMPLES, "/", s, "/quantifications/kallisto/", assembly_version, '/', sequencing_type)
@@ -103,17 +125,63 @@ pca_sleuth <- function() {
 	tab_metadata$path <- paths
 
 	# (1) load the kallisto processed data and make a regression model using 'condition' as the dependent variable
-  	so <- sleuth_prep(tab_metadata, ~ condition, target_mapping = target_mapping)
+	# also, `target_mapping` adds annotation information (e.g. gene_id)
+	if (level == 'gene') {
+	  	so <- sleuth_prep(tab_metadata, ~ condition, target_mapping = target_mapping, aggregation_column = 'gene_id')	
+	} else if (level == 'transcript') {
+	  	so <- sleuth_prep(tab_metadata, ~ condition, target_mapping = target_mapping)
+	}
+  
+	# (2) estimate parameters for the sleuth response error measurement (full) model as responding to the 'condition' factor
+  	so <- sleuth_fit(so)
+  
+	# (3) Create another model where the gene expression is not dependent on any factor.
+  	so <- sleuth_fit(so, ~1, 'reduced')
+  
+	# (4.1) Run a likelihood ratio test (LRT) between the two models to see what transcripts appear 
+	# to really be affected by the time factor value
+	so <- sleuth_lrt(so, 'reduced', 'full')
 
-	png(paste0(ANALYSIS, "/figures/pca_tpm.png"), res = 150, w = 1500, h = 500)
+	# (4.2) Run the Wald test (WT), a statistical tests which:
+	# - is somewhat related to the LRT and is also used to test for differential expression
+	# - LRT is considerd a better test than the WT but
+	# - WT is used becase it generates the beta statistic, which approximates to the fold change in expression between
+	# the 2 condition tested, which is typically reported in differential expression analysis
+	so <- sleuth_wt(so, paste0('condition'))
+
+	# export normalised transcript abundance values (no needed for level = gene)
+	if (level == 'transcript') {
+		condition1_name <- tolower(condition1)
+		condition2_name <- tolower(condition2)
+		otab = paste0(ANALYSIS, "/tables/normalized_abundance_", level, "_level_sleuth_", condition1_name, "_", condition2_name, ".tsv")
+ 		write.table(kallisto_table(so), otab, sep = "\t", quote = FALSE, row.names = FALSE)
+ 	}
+
+	# add beta (b), beta's standard error (se_b) and the mean expression in the samples (mean_obs)
+ 	res_lrt <- sleuth_results(so, 'reduced:full', test_type = 'lrt')
+ 	res_wt <- sleuth_results(so, 'condition')
+ 	res <- merge(res_lrt, res_wt[, c('target_id', 'b', 'se_b', 'mean_obs')], on = 'target_id', sort = FALSE)
+	
+	# export
+	condition1_name <- tolower(condition1)
+	condition2_name <- tolower(condition2)
+	otab = paste0(ANALYSIS, "/tables/differential_expression_analysis_", level, "_level_sleuth_", condition1_name, "_", condition2_name, ".tsv")
+ 	write.table(res, otab, sep = "\t", quote = FALSE, row.names = FALSE)
+
+ 	# perform principal component analysis (PCA)
+	png(paste0(ANALYSIS, "/figures/pca_tpm_", level, ".png"), res = 150, w = 1500, h = 500)
 	par(mfrow = c(1, 2))
-	p1 <- plot_pca(so, pc_x = 1L, pc_y = 2L, units = 'tpm', color_by = 'condition')
-	p2 <- plot_pc_variance(so, units = 'tpm', PC_relative = TRUE)
+	p1 <- plot_pca(so, pc_x = 1L, pc_y = 2L, color_by = 'condition_name')
+	p2 <- plot_pc_variance(so, PC_relative = TRUE)
 	plot_grid(p1, p2, align = "h")
 	dev.off()
 
+ 	return(so)
+
 }
 
-pca_sleuth()
+sleuth_object_transcript <- diff_exp_sleuth("scramble", "HOXA1KD", 'transcript')
+sleuth_object = diff_exp_sleuth("scramble", "HOXA1KD", 'gene')
+
 
 
